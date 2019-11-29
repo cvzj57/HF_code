@@ -34,6 +34,14 @@ class HartreeFocker:
         self.contracted_basis_functions = 0
         self.coords = self.read_coords()
         self.basis = self.read_basis()
+        self.charge_dict = {
+            'h': 1,
+            'he': 2,
+            'li': 3,
+            'be': 4,
+            'b': 5,
+            'c': 6,
+        }
 
     def read_coords(self):
         sample_coords = [
@@ -59,6 +67,10 @@ class HartreeFocker:
         }
         return example_basis_file_dict
 
+    def get_charge(self, atom_index):
+        element = [atom['el'] for atom in self.coords if atom['#'] == atom_index][0]
+        return self.charge_dict['element']
+
     def contract_basis_function(self, list_of_primitives):
         # contract any necessary primitives.
         pass
@@ -70,6 +82,38 @@ class HartreeFocker:
 
     def measure_atom_atom_dist(self, index_1, index_2):
         return numpy.linalg.norm(self.vectorise_atom(index_2) - self.vectorise_atom(index_1))
+
+    def gaussian_product(self, exp_a, exp_b, index_a, index_b):
+        # Product of two Gaussians is a Gaussian
+        # each input is a coefficient and the coordinates of the centre
+
+        ra = self.vectorise_atom(index_a)
+        rb = self.vectorise_atom(index_b)
+
+        exp_c = exp_a + exp_b
+        diff = numpy.linalg.norm(ra - rb)**2
+        N = (4*exp_a*exp_b/(numpy.pi**2))**0.75
+        K = N*numpy.exp(-exp_a*exp_b/exp_c*diff)
+        rc = (exp_a*ra + exp_b*rb)/exp_c
+
+        return exp_c, diff, K, rc
+
+    def erf(self, t):
+        P = 0.3275911
+        A = [0.254829592, -0.284496736, 1.42141374, 1.453152027, 1.061405429]
+        T = 1.0/(1+P*t)
+        Tn = T
+        polynomial = A[0]*Tn
+        for i in range(1,5):
+            Tn = Tn*T
+            polynomial = polynomial*A[i]*Tn
+        return 1.0-polynomial*numpy.exp(-t*t)
+
+    def F0(self, t):
+        if t == 0:
+            return 1
+        else:
+            return (0.5*(numpy.pi/t)**0.5)*self.erf(t**0.5)
 
     def calculate_normalisation_factor(self, basis_function):
         #TODO generalise to all angular momenta, this is s only.
@@ -125,37 +169,111 @@ class HartreeFocker:
         # diagonalise the overlap matrix? There are numpy functions for this.
         return numpy.linalg.eig(matrix)
 
-    def T(self):
-        # kinetic
-        pass
+    def new_overlap(self, exp_a, exp_b, index_a, index_b):
+        exp_c, diff, K, rc = self.gaussian_product(exp_a, exp_b, index_a, index_b)
+        multiplier = (numpy.pi/exp_c)**(3/2)
+        return multiplier*K
 
-    def E_nuc(self):
-        # nuclear repulsion
-        pass
+    def T(self, exp_a, exp_b, index_a, index_b):
+        """Kinetic energy integral"""
+        exp_c, diff, K, rc = self.gaussian_product(exp_a, exp_b, index_a, index_b)
+        multiplier = (numpy.pi/exp_c)**1.5
 
-    def V(self):
-        # two-e bit
-        pass
+        ra = self.vectorise_atom(index_a)
+        rb = self.vectorise_atom(index_b)
+
+        reduced_exponent = exp_a*exp_b/exp_c
+        return reduced_exponent*(3-2*reduced_exponent*diff)*multiplier*K
+
+    def e_n(self, exp_a, exp_b, index_a, index_b, index_other_atom):
+        """Electron-nuclear integral"""
+        exp_c, diff, K, rc = self.gaussian_product(exp_a, exp_b, index_a, index_b)
+        vector_other_atom = self.vectorise_atom(index_other_atom)
+        Z_other_atom = self.get_charge(index_other_atom)
+
+        return (-2*numpy.pi*Z_other_atom/exp_c)*K*self.F0(exp_c*numpy.linalg.norm(rc-vector_other_atom))
+
+    def V(self, exp_a, exp_b, index_a, index_b, exp_c, exp_d, index_c, index_d):
+        """Two-e integral"""
+        exp_e, diff_ab, K_ab, re = self.gaussian_product(exp_a, exp_b, index_a, index_b)
+        exp_f, diff_cd, K_cd, rf = self.gaussian_product(exp_c, exp_d, index_c, index_d)
+
+        mutiplier = 2*numpy.pi**(5/2)*(exp_e*exp_f*(exp_e+exp_f)**(1/2))**-1
+        return mutiplier*K_ab*K_cd*self.F0(exp_e*exp_f/(exp_e+exp_f)*numpy.linalg.norm(re-rf)**2)
+
+    def run_SCF(self):
+
+        # work out total number of basis functions for matrix size
+        # take basis functions, associate with their atoms (need distances between centres)
+        basis_functions = []
+        for atom in self.coords:
+            basis_functions.extend([(atom, basis_function) for key, basis_function in iter(self.basis['$basis'][atom['basis']].items())])
+
+        empty_matrix = numpy.zeros([len(basis_functions), len(basis_functions)])
+
+        # Create overlap matrix
+        S = empty_matrix
+        # Create kinetic matrix
+        T = empty_matrix
+        # Create e_n matrix
+        P = empty_matrix
+        # Create two-electron matrix
+        V = empty_matrix
+
+        # Iterate through them and build the matrices
+        for i, row_i in enumerate(basis_functions):
+            for j, col_j in enumerate(basis_functions):
+                print(row_i[1])
+                S[i][j] = self.new_overlap(row_i[1]['exponent'], row_i[0]['#'], col_j[1]['exponent'], col_j[0]['#'])
+                T[i][j] = self.T(row_i[1]['exponent'], row_i[0]['#'], col_j[1]['exponent'], col_j[0]['#'])
+
+        print(S)
+        print(T)
+
+        # Iterate through atoms
+        # for atom in self.coords:
+        #     atom_vector = self.vectorise_atom(atom['#'])
+        #     atom_charge = self.get_charge(atom['#'])
+
+        Hcore = T + P
+
+        # Create initial Fock matrix with Hcore guess
+        Fock0 = S**(-1/2)*Hcore*S**(-1/2)
+        # Diagonalise
+        Fock_diag = numpy.linalg.eig(Fock0)
+
+        # Return to AO basis
+
+        # Create density matrix
+
+        # Compute first SCF energy
+
+        # start iterating
+        # test for convergence
+
+        return
+
 
     def generate_new_guess(self):
         # take previous orbitals and use them to make a new guess set
         pass
 
-    def run_SCF(self):
-        this_iteration_E = 0
-        last_iteration_E = 0
-
-        def check_convergence(this_E, last_E):
-            if this_E-last_E < self.convergence or self.current_iteration > self.max_iterations:
-                return True
-            else:
-                return False
-
-        while not check_convergence(this_iteration_E, last_iteration_E):
-            pass
-        # Run the SCF procedure until self-consistency is reached
-        pass
+    # def run_SCF(self):
+    #     this_iteration_E = 0
+    #     last_iteration_E = 0
+    #
+    #     def check_convergence(this_E, last_E):
+    #         if this_E-last_E < self.convergence or self.current_iteration > self.max_iterations:
+    #             return True
+    #         else:
+    #             return False
+    #
+    #     while not check_convergence(this_iteration_E, last_iteration_E):
+    #         pass
+    #     # Run the SCF procedure until self-consistency is reached
+    #     pass
 
 if __name__ == "__main__":
     control = HartreeFocker()
-    control.build_overlap_matrix()
+    control.run_SCF()
+#    control.build_overlap_matrix()
